@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source "$(dirname "$0")/_common.sh"
+ai::setup_path
+
+API_URL=""
+MODEL=""
+
+usage() {
+	cat <<EOF
+Usage: $(basename "$0") [OPTIONS]
+
+Options:
+  --api-url URL    Custom API endpoint
+  --model MODEL    Model to use (e.g., gpt-5.2, claude-sonnet-4.5)
+  -h, --help      Show this help message
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		--api-url)
+			API_URL="$2"
+			shift 2
+			;;
+		--model)
+			MODEL="$2"
+			shift 2
+			;;
+		-h|--help)
+			usage
+			exit 0
+			;;
+		*)
+			break
+			;;
+	esac
+done
+
+self_path="$(ai::self_path "$0")"
+copilot_bin="$(ai::resolve_bin copilot "$self_path" "$HOME/.local/bin/copilot" || true)"
+
+if [[ -z "$copilot_bin" ]] || [[ "$(readlink -f "$copilot_bin")" == "$self_path" ]]; then
+	echo "Installing @github/copilot..." >&2
+	ai::npm_install_latest @github/copilot
+	copilot_bin="$(ai::resolve_bin copilot "$self_path" "$HOME/.local/bin/copilot" || true)"
+	if [[ -z "$copilot_bin" ]] || [[ "$(readlink -f "$copilot_bin")" == "$self_path" ]]; then
+		echo "copilot installation failed" >&2
+		exit 1
+	fi
+fi
+
+if [[ -n "$MODEL" ]]; then
+	export COPILOT_MODEL="$MODEL"
+fi
+
+IS_SANDBOX=1 "$copilot_bin" --allow-all --autopilot "$@"

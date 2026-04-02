@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source "$(dirname "$0")/_common.sh"
+ai::setup_path
+
+API_URL=""
+MODEL=""
+SERVER=""
+
+usage() {
+	cat <<EOF
+Usage: $(basename "$0") [OPTIONS]
+
+Options:
+  --api-url URL    Custom OpenAI-compatible API endpoint
+  --server ADDR:PORT
+                   Custom OpenAI-compatible inference server
+  --model MODEL   Model to use (e.g., gpt-5, deepseek-coder:6.7b)
+  -h, --help      Show this help message
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		--api-url)
+			API_URL="$2"
+			shift 2
+			;;
+		--server)
+			SERVER="$2"
+			shift 2
+			;;
+		--model)
+			MODEL="$2"
+			shift 2
+			;;
+		-h|--help)
+			usage
+			exit 0
+			;;
+		*)
+			break
+			;;
+	esac
+done
+
+if [[ -n "$SERVER" ]]; then
+	if [[ "$SERVER" == http://* ]] || [[ "$SERVER" == https://* ]]; then
+		API_URL="$SERVER"
+	else
+		API_URL="http://$SERVER"
+	fi
+fi
+
+self_path="$(ai::self_path "$0")"
+codex_bin="$(ai::resolve_bin codex "$self_path" || true)"
+
+if [[ -z "$codex_bin" ]] || [[ "$(readlink -f "$codex_bin")" == "$self_path" ]]; then
+	echo "Installing @openai/codex..." >&2
+	ai::npm_install_latest @openai/codex
+	codex_bin="$(ai::resolve_bin codex "$self_path" || true)"
+	if [[ -z "$codex_bin" ]] || [[ "$(readlink -f "$codex_bin")" == "$self_path" ]]; then
+		echo "codex installation failed" >&2
+		exit 1
+	fi
+fi
+
+if [[ -n "$API_URL" ]]; then
+	export OPENAI_API_BASE="$API_URL"
+fi
+
+args=()
+
+if [[ -n "$MODEL" ]]; then
+	args+=(--model "$MODEL")
+fi
+
+args+=("$@")
+
+IS_SANDBOX=1 "$codex_bin" --dangerously-bypass-approvals-and-sandbox "${args[@]}"

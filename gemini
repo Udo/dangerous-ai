@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source "$(dirname "$0")/_common.sh"
+ai::setup_path
+
+MODEL=""
+API_URL=""
+SERVER=""
+
+usage() {
+	cat <<EOF
+Usage: $(basename "$0") [OPTIONS] [gemini args...]
+
+Options:
+  --model MODEL         Model to use (for example: auto, pro, flash, gemini-2.5-pro)
+  --api-url URL         Not supported by Gemini CLI
+  --server ADDR:PORT    Not supported by Gemini CLI
+  -h, --help            Show this help message
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		--model)
+			MODEL="$2"
+			shift 2
+			;;
+		--api-url)
+			API_URL="$2"
+			shift 2
+			;;
+		--server)
+			SERVER="$2"
+			shift 2
+			;;
+		-h|--help)
+			usage
+			exit 0
+			;;
+		*)
+			break
+			;;
+	esac
+done
+
+if [[ -n "$API_URL" ]] || [[ -n "$SERVER" ]]; then
+	echo "Gemini CLI does not currently document support for custom inference server endpoints." >&2
+	exit 1
+fi
+
+self_path="$(ai::self_path "$0")"
+gemini_bin="$(ai::resolve_bin gemini "$self_path" "$HOME/.local/bin/gemini" || true)"
+
+if [[ -z "$gemini_bin" ]] || [[ "$(readlink -f "$gemini_bin")" == "$self_path" ]]; then
+	echo "Installing @google/gemini-cli..." >&2
+	ai::npm_install_latest @google/gemini-cli
+	gemini_bin="$(ai::resolve_bin gemini "$self_path" "$HOME/.local/bin/gemini" || true)"
+	if [[ -z "$gemini_bin" ]] || [[ "$(readlink -f "$gemini_bin")" == "$self_path" ]]; then
+		echo "gemini installation failed" >&2
+		exit 1
+	fi
+fi
+
+args=()
+
+if [[ -n "$MODEL" ]]; then
+	args+=(--model "$MODEL")
+fi
+
+args+=("$@")
+
+"$gemini_bin" "${args[@]}"

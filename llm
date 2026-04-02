@@ -1,0 +1,469 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source "$(dirname "$0")/_common.sh"
+ai::setup_path
+
+API_URL=""
+MODEL=""
+SERVER=""
+TEMP_LLM_USER_PATH=""
+
+usage() {
+	cat <<EOF
+Usage: $(basename "$0") [OPTIONS] [llm args...]
+
+Options:
+  --api-url URL         Custom OpenAI-compatible API endpoint for this invocation
+  --model MODEL         Model to use
+  --server ADDR:PORT    Add/update a persistent OpenAI/Ollama-compatible server in llm config
+  -h, --help            Show this help message
+EOF
+}
+
+cleanup() {
+	if [[ -n "$TEMP_LLM_USER_PATH" ]] && [[ -d "$TEMP_LLM_USER_PATH" ]]; then
+		rm -rf "$TEMP_LLM_USER_PATH"
+	fi
+}
+
+trap cleanup EXIT
+
+normalize_server_url() {
+	local raw="$1"
+
+	if [[ "$raw" == http://* ]] || [[ "$raw" == https://* ]]; then
+		printf '%s\n' "$raw"
+	else
+		printf 'http://%s\n' "$raw"
+	fi
+}
+
+llm_user_dir() {
+	python3 - <<'PY'
+import os
+from pathlib import Path
+
+xdg_config_home = os.environ.get("XDG_CONFIG_HOME")
+if xdg_config_home:
+    print(Path(xdg_config_home).expanduser() / "io.datasette.llm")
+else:
+    print(Path.home() / ".config" / "io.datasette.llm")
+PY
+}
+
+install_with_apt() {
+    local package_name="$1"
+
+    if ! command -v apt-get >/dev/null 2>&1; then
+        return 1
+    fi
+
+    if [[ "$(id -u)" -ne 0 ]]; then
+        echo "$package_name is required to install llm automatically; rerun as root or install $package_name" >&2
+        return 1
+    fi
+
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update >&2
+    apt-get install -y "$package_name" >&2
+}
+
+can_create_python_venv() {
+    local test_root
+
+    test_root="$(mktemp -d)"
+    if python3 -m venv "$test_root/venv" >/dev/null 2>&1; then
+        rm -rf "$test_root"
+        return 0
+    fi
+
+    rm -rf "$test_root"
+    return 1
+}
+
+ensure_python_venv() {
+    local versioned_package
+
+    if can_create_python_venv; then
+        return 0
+    fi
+
+    python3 -m ensurepip --upgrade >&2 || true
+    if can_create_python_venv; then
+        return 0
+    fi
+
+    versioned_package="$(python3 - <<'PY'
+import sys
+
+print(f"python{sys.version_info.major}.{sys.version_info.minor}-venv")
+PY
+)"
+
+    install_with_apt python3-venv || true
+    if can_create_python_venv; then
+        return 0
+    fi
+
+    install_with_apt "$versioned_package"
+    can_create_python_venv
+}
+
+ensure_llm_installed() {
+    local self_path llm_bin install_root venv_dir venv_bin venv_pip
+
+	self_path="$(readlink -f "$0")"
+	llm_bin="$(command -v llm 2>/dev/null || true)"
+
+	if [[ -n "$llm_bin" ]] && [[ "$(readlink -f "$llm_bin")" != "$self_path" ]]; then
+		printf '%s\n' "$llm_bin"
+		return 0
+	fi
+
+	echo "Installing simonw/llm..." >&2
+    if ! ensure_python_venv; then
+        echo "Unable to enable python3 venv support automatically" >&2
+        exit 1
+    fi
+
+    if [[ "$(id -u)" -eq 0 ]]; then
+        install_root="/usr/local/lib/ai-llm"
+    else
+        install_root="$HOME/.local/lib/ai-llm"
+	fi
+
+    venv_dir="$install_root/venv"
+    venv_bin="$venv_dir/bin/llm"
+    venv_pip="$venv_dir/bin/pip"
+
+    mkdir -p "$install_root"
+    if [[ ! -x "$venv_pip" ]]; then
+        rm -rf "$venv_dir"
+        python3 -m venv "$venv_dir" >&2
+    fi
+
+    "$venv_pip" install --upgrade pip setuptools wheel >&2
+    "$venv_pip" install --upgrade llm >&2
+
+    if [[ "$(id -u)" -eq 0 ]]; then
+        ln -sf "$venv_bin" /usr/local/bin/llm
+    fi
+
+	llm_bin="$(command -v llm 2>/dev/null || true)"
+    if [[ -z "$llm_bin" ]] && [[ -x "$venv_bin" ]]; then
+        llm_bin="$venv_bin"
+    fi
+	if [[ -z "$llm_bin" ]] || [[ "$(readlink -f "$llm_bin")" == "$self_path" ]]; then
+		echo "llm installation failed" >&2
+		exit 1
+	fi
+
+	printf '%s\n' "$llm_bin"
+}
+
+configure_llm_models() {
+	local mode="$1"
+	local server_input="$2"
+	local target_user_dir="$3"
+	local source_user_dir="${4:-}"
+    local python_bin="${5:-python3}"
+
+    SERVER_INPUT="$server_input" TARGET_USER_DIR="$target_user_dir" SOURCE_USER_DIR="$source_user_dir" MODE="$mode" "$python_bin" - <<'PY'
+import json
+import os
+import re
+import shutil
+import sys
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+import yaml
+
+
+def normalize_server_url(raw):
+    if raw.startswith(("http://", "https://")):
+        return raw
+    return f"http://{raw}"
+
+
+def sanitize_provider_id(server_input):
+    provider_id = server_input.lower()
+    provider_id = re.sub(r"^[a-z][a-z0-9+.-]*://", "", provider_id)
+    provider_id = re.sub(r"[^a-z0-9]", "-", provider_id)
+    provider_id = re.sub(r"-+", "-", provider_id).strip("-")
+    return f"local-{provider_id}"
+
+
+def fetch_json(url):
+    req = Request(url, headers={"Accept": "application/json"})
+    with urlopen(req, timeout=5) as response:
+        charset = response.headers.get_content_charset() or "utf-8"
+        return json.loads(response.read().decode(charset))
+
+
+def detect_models(server_input):
+    server_url = normalize_server_url(server_input).rstrip("/")
+    base_origin = server_url[:-3] if server_url.endswith("/v1") else server_url
+    errors = []
+
+    for url in (f"{server_url}/v1/models", f"{base_origin}/v1/models"):
+        try:
+            payload = fetch_json(url)
+            data = payload.get("data") or []
+            model_ids = [item.get("id") for item in data if isinstance(item, dict) and item.get("id")]
+            if model_ids:
+                return {
+                    "provider_name": f"OpenAI-compatible ({server_url})",
+                    "api_base": url[:-7],
+                    "model_ids": model_ids,
+                }
+            errors.append((url, "no models returned"))
+        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+            errors.append((url, str(exc)))
+
+    for url in (f"{base_origin}/api/tags", f"{server_url}/api/tags"):
+        try:
+            payload = fetch_json(url)
+            data = payload.get("models") or []
+            model_ids = [item.get("name") for item in data if isinstance(item, dict) and item.get("name")]
+            if model_ids:
+                return {
+                    "provider_name": f"Ollama ({base_origin})",
+                    "api_base": f"{base_origin}/v1",
+                    "model_ids": model_ids,
+                }
+            errors.append((url, "no models returned"))
+        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+            errors.append((url, str(exc)))
+
+    print("Could not detect models from the server.", file=sys.stderr)
+    for url, message in errors:
+        print(f"  {url}: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def load_yaml_list(path):
+    if not path.exists():
+        return []
+    raw = path.read_text(encoding="utf-8").strip()
+    if not raw:
+        return []
+    data = yaml.safe_load(raw)
+    if data is None:
+        return []
+    if not isinstance(data, list):
+        print(f"Expected a YAML list in {path}", file=sys.stderr)
+        sys.exit(1)
+    return data
+
+
+mode = os.environ["MODE"]
+server_input = os.environ["SERVER_INPUT"]
+target_user_dir = Path(os.environ["TARGET_USER_DIR"]).expanduser()
+source_user_dir_raw = os.environ.get("SOURCE_USER_DIR", "")
+source_user_dir = Path(source_user_dir_raw).expanduser() if source_user_dir_raw else None
+
+target_user_dir.mkdir(parents=True, exist_ok=True)
+
+if mode == "temp" and source_user_dir:
+    source_user_dir.mkdir(parents=True, exist_ok=True)
+    for child in source_user_dir.iterdir():
+        if child.name == "extra-openai-models.yaml":
+            continue
+        destination = target_user_dir / child.name
+        if destination.exists():
+            continue
+        try:
+            destination.symlink_to(child)
+        except OSError:
+            if child.is_dir():
+                shutil.copytree(child, destination, symlinks=True)
+            else:
+                shutil.copy2(child, destination)
+
+provider_id = sanitize_provider_id(server_input)
+detected = detect_models(server_input)
+model_ids = detected["model_ids"]
+prefixed_model_ids = [f"{provider_id}/{model_id}" for model_id in model_ids]
+
+base_entries = []
+source_config = None
+if source_user_dir:
+    source_config = source_user_dir / "extra-openai-models.yaml"
+    base_entries = load_yaml_list(source_config)
+
+target_config = target_user_dir / "extra-openai-models.yaml"
+if not base_entries:
+    base_entries = load_yaml_list(target_config)
+
+base_entries = [
+    entry for entry in base_entries
+    if isinstance(entry, dict) and not str(entry.get("model_id", "")).startswith(f"{provider_id}/")
+]
+
+keys_path = (source_user_dir or target_user_dir) / "keys.json"
+api_key_name = None
+if os.environ.get("OPENAI_API_KEY"):
+    api_key_name = "openai"
+elif keys_path.exists():
+    try:
+        keys = json.loads(keys_path.read_text(encoding="utf-8"))
+        if isinstance(keys, dict) and "openai" in keys:
+            api_key_name = "openai"
+    except json.JSONDecodeError:
+        pass
+
+for model_id in model_ids:
+    entry = {
+        "model_id": f"{provider_id}/{model_id}",
+        "model_name": model_id,
+        "api_base": detected["api_base"],
+    }
+    if api_key_name:
+        entry["api_key_name"] = api_key_name
+    base_entries.append(entry)
+
+target_config.write_text(
+    yaml.safe_dump(base_entries, sort_keys=False, default_flow_style=False),
+    encoding="utf-8",
+)
+
+print(
+    f"Configured provider '{provider_id}' with {len(model_ids)} model(s) in {target_config}",
+    file=sys.stderr,
+)
+for model_id in prefixed_model_ids:
+    print(f"  - {model_id}", file=sys.stderr)
+
+json.dump(
+    {
+        "provider_id": provider_id,
+        "default_model_id": prefixed_model_ids[0] if prefixed_model_ids else None,
+        "model_ids": prefixed_model_ids,
+        "user_dir": str(target_user_dir),
+    },
+    sys.stdout,
+)
+PY
+}
+
+read_json_field() {
+	local json_input="$1"
+	local field="$2"
+
+	JSON_INPUT="$json_input" FIELD_NAME="$field" python3 - <<'PY'
+import json
+import os
+
+data = json.loads(os.environ["JSON_INPUT"])
+value = data
+for part in os.environ["FIELD_NAME"].split("."):
+    value = value.get(part)
+print("" if value is None else value)
+PY
+}
+
+map_model_to_provider() {
+	local provider_id="$1"
+	local model="$2"
+
+	if [[ -z "$model" ]]; then
+		printf '\n'
+	elif [[ "$model" == */* ]]; then
+		printf '%s\n' "$model"
+	else
+		printf '%s/%s\n' "$provider_id" "$model"
+	fi
+}
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		--api-url)
+			API_URL="$2"
+			shift 2
+			;;
+		--api-url=*)
+			API_URL="${1#*=}"
+			shift
+			;;
+		--model)
+			MODEL="$2"
+			shift 2
+			;;
+		--model=*)
+			MODEL="${1#*=}"
+			shift
+			;;
+		--server)
+			SERVER="$2"
+			shift 2
+			;;
+		--server=*)
+			SERVER="${1#*=}"
+			shift
+			;;
+		-h|--help)
+			usage
+			exit 0
+			;;
+		*)
+			break
+			;;
+	esac
+done
+
+if [[ -n "$API_URL" ]] && [[ -n "$SERVER" ]]; then
+	echo "Use either --api-url or --server, not both" >&2
+	exit 1
+fi
+
+llm_bin="$(ensure_llm_installed)"
+base_user_dir="$(llm_user_dir)"
+llm_python="$(dirname "$(readlink -f "$llm_bin")")/python"
+
+if [[ ! -x "$llm_python" ]]; then
+    llm_python="python3"
+fi
+
+if [[ -n "$SERVER" ]]; then
+    server_config_json="$(configure_llm_models persist "$SERVER" "$base_user_dir" "" "$llm_python")"
+	server_provider_id="$(read_json_field "$server_config_json" provider_id)"
+	if [[ -n "$MODEL" ]]; then
+		MODEL="$(map_model_to_provider "$server_provider_id" "$MODEL")"
+	else
+		MODEL="$(read_json_field "$server_config_json" default_model_id)"
+	fi
+fi
+
+if [[ -n "$API_URL" ]]; then
+	TEMP_LLM_USER_PATH="$(mktemp -d)"
+    api_config_json="$(configure_llm_models temp "$API_URL" "$TEMP_LLM_USER_PATH" "$base_user_dir" "$llm_python")"
+	export LLM_USER_PATH="$TEMP_LLM_USER_PATH"
+	api_provider_id="$(read_json_field "$api_config_json" provider_id)"
+	if [[ -n "$MODEL" ]]; then
+		MODEL="$(map_model_to_provider "$api_provider_id" "$MODEL")"
+	else
+		MODEL="$(read_json_field "$api_config_json" default_model_id)"
+	fi
+fi
+
+args=("$@")
+
+if [[ ${#args[@]} -eq 0 ]]; then
+    args=(chat)
+fi
+
+if [[ -n "$MODEL" ]]; then
+	case "${args[0]-}" in
+		""|-*)
+			args=(-m "$MODEL" "${args[@]}")
+			;;
+		prompt|chat|embed|embed-multi)
+			args=("${args[0]}" -m "$MODEL" "${args[@]:1}")
+			;;
+	esac
+fi
+
+"$llm_bin" "${args[@]}"

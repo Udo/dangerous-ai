@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source "$(dirname "$0")/_common.sh"
+ai::setup_path
+
+API_URL=""
+MODEL=""
+SERVER=""
+
+usage() {
+	cat <<EOF
+Usage: $(basename "$0") [OPTIONS] [opencode args...]
+
+Options:
+  --api-url URL         Custom API endpoint (OpenAI-compatible)
+  --model MODEL         Model to use (e.g., anthropic/claude-sonnet-4-6)
+  --server ADDR:PORT    Add/update a persistent OpenAI/Ollama-compatible server in opencode config
+  -h, --help            Show this help message
+EOF
+}
+
+normalize_server_url() {
+	local raw="$1"
+
+	if [[ "$raw" == http://* ]] || [[ "$raw" == https://* ]]; then
+		printf '%s\n' "$raw"
+	else
+		printf 'http://%s\n' "$raw"
+	fi
+}
+
+configure_server() {
+	local server_input="$1"
+	local server_url config_path provider_id
+
+	server_url="$(normalize_server_url "$server_input")"
+	config_path="$HOME/.config/opencode/opencode.json"
+	provider_id="$(printf '%s' "$server_input" | tr '[:upper:]' '[:lower:]' | sed 's#^[a-z][a-z0-9+.-]*://##; s#[^a-z0-9]#-#g; s#-\\{2,\\}#-#g; s#^-##; s#-$##')"
+	provider_id="local-${provider_id}"
+
+	SERVER_URL="$server_url" CONFIG_PATH="$config_path" PROVIDER_ID="$provider_id" python3 - <<'PY'
+import json
+import os
+import re
+import sys
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+server_url = os.environ["SERVER_URL"].rstrip("/")
+config_path = Path(os.environ["CONFIG_PATH"]).expanduser()
+provider_id = os.environ["PROVIDER_ID"]
+
+base_origin = server_url
+if base_origin.endswith("/v1"):
+    base_origin = base_origin[:-3]
+
+
+def fetch_json(url):
+    req = Request(url, headers={"Accept": "application/json"})
+    with urlopen(req, timeout=5) as resp:
+        charset = resp.headers.get_content_charset() or "utf-8"
+        return json.loads(resp.read().decode(charset))
+
+
+provider_name = None
+base_url = None
+model_ids = []
+errors = []
+
+for url in (f"{server_url}/v1/models", f"{base_origin}/v1/models"):
+    if url in {err[0] for err in errors}:
+        continue
+    try:
+        payload = fetch_json(url)
+        data = payload.get("data") or []
+        model_ids = [item.get("id") for item in data if isinstance(item, dict) and item.get("id")]
+        if model_ids:
+            provider_name = f"OpenAI-compatible ({server_url})"
+            base_url = url[:-7]
+            break
+        errors.append((url, "no models returned"))
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+        errors.append((url, str(exc)))
+
+if not model_ids:
+    for url in (f"{base_origin}/api/tags", f"{server_url}/api/tags"):
+        if url in {err[0] for err in errors}:
+            continue
+        try:
+            payload = fetch_json(url)
+            data = payload.get("models") or []
+            model_ids = [item.get("name") for item in data if isinstance(item, dict) and item.get("name")]
+            if model_ids:
+                provider_name = f"Ollama ({base_origin})"
+                base_url = f"{base_origin}/v1"
+                break
+            errors.append((url, "no models returned"))
+        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+            errors.append((url, str(exc)))
+
+if not model_ids:
+    print("Could not detect models from the server.", file=sys.stderr)
+    for url, message in errors:
+        print(f"  {url}: {message}", file=sys.stderr)
+    sys.exit(1)
+
+config = {
+    "$schema": "https://opencode.ai/config.json",
+}
+
+if config_path.exists():
+    raw = config_path.read_text(encoding="utf-8")
+    stripped = re.sub(r"/\*.*?\*/", "", raw, flags=re.S)
+    stripped = re.sub(r"^\s*//.*$", "", stripped, flags=re.M)
+    stripped = re.sub(r",(\s*[}\]])", r"\1", stripped)
+    stripped = stripped.strip()
+    if stripped:
+        try:
+            config = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            print(f"Could not parse existing opencode config at {config_path}: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+if not isinstance(config, dict):
+    print(f"Expected top-level object in {config_path}", file=sys.stderr)
+    sys.exit(1)
+
+config.setdefault("$schema", "https://opencode.ai/config.json")
+providers = config.setdefault("provider", {})
+
+if not isinstance(providers, dict):
+    print(f"Expected 'provider' to be an object in {config_path}", file=sys.stderr)
+    sys.exit(1)
+
+provider_models = {}
+for model_id in model_ids:
+    provider_models[model_id] = {
+        "name": model_id,
+    }
+
+providers[provider_id] = {
+    "npm": "@ai-sdk/openai-compatible",
+    "name": provider_name,
+    "options": {
+        "baseURL": base_url,
+    },
+    "models": provider_models,
+}
+
+config_path.parent.mkdir(parents=True, exist_ok=True)
+config_path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+print(f"Configured provider '{provider_id}' with {len(model_ids)} model(s) in {config_path}", file=sys.stderr)
+for model_id in model_ids:
+    print(f"  - {provider_id}/{model_id}", file=sys.stderr)
+PY
+}
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		--api-url)
+			API_URL="$2"
+			shift 2
+			;;
+		--model)
+			MODEL="$2"
+			shift 2
+			;;
+		--server)
+			SERVER="$2"
+			shift 2
+			;;
+		-h|--help)
+			usage
+			exit 0
+			;;
+		*)
+			break
+			;;
+	esac
+done
+
+self_path="$(ai::self_path "$0")"
+opencode_bin="$(ai::resolve_bin opencode "$self_path" "$HOME/.opencode/bin/opencode" "$HOME/.local/bin/opencode" || true)"
+
+if [[ -z "$opencode_bin" ]] || [[ "$(readlink -f "$opencode_bin")" == "$self_path" ]]; then
+	echo "Installing opencode-ai..." >&2
+	ai::npm_install_latest opencode-ai
+	opencode_bin="$(ai::resolve_bin opencode "$self_path" "$HOME/.opencode/bin/opencode" "$HOME/.local/bin/opencode" || true)"
+	if [[ -z "$opencode_bin" ]] || [[ "$(readlink -f "$opencode_bin")" == "$self_path" ]]; then
+		echo "opencode installation failed" >&2
+		exit 1
+	fi
+fi
+
+if [[ -n "$SERVER" ]]; then
+	configure_server "$SERVER"
+fi
+
+if [[ -n "$API_URL" ]]; then
+	export LOCAL_ENDPOINT="$API_URL"
+fi
+
+if [[ -z "${OPENCODE_PERMISSION:-}" ]]; then
+	export OPENCODE_PERMISSION='{"*":"allow","external_directory":"allow","doom_loop":"allow"}'
+fi
+
+args=()
+
+if [[ -n "$MODEL" ]]; then
+	args+=(--model "$MODEL")
+fi
+
+args+=("$@")
+
+"$opencode_bin" "${args[@]}"

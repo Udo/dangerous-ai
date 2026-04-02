@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source "$(dirname "$0")/_common.sh"
+ai::setup_path
+
+API_URL=""
+MODEL=""
+SERVER=""
+
+usage() {
+	cat <<EOF
+Usage: $(basename "$0") [OPTIONS] [aider args...]
+
+Options:
+  --api-url URL         Custom OpenAI-compatible API endpoint
+  --model MODEL         Model to use (for example: openai/gpt-4o or openai/qwen2.5-coder)
+  --server ADDR:PORT    Add/update a persistent OpenAI/Ollama-compatible server in aider config
+  -h, --help            Show this help message
+EOF
+}
+
+normalize_server_url() {
+	local raw="$1"
+
+	if [[ "$raw" == http://* ]] || [[ "$raw" == https://* ]]; then
+		printf '%s\n' "$raw"
+	else
+		printf 'http://%s\n' "$raw"
+	fi
+}
+
+configure_server() {
+	local server_input="$1"
+	local server_url config_path
+
+	server_url="$(normalize_server_url "$server_input")"
+	config_path="$HOME/.aider.conf.yml"
+
+	SERVER_URL="$server_url" CONFIG_PATH="$config_path" MODEL_OVERRIDE="$MODEL" python3 - <<'PY'
+import json
+import os
+import re
+import sys
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+server_url = os.environ["SERVER_URL"].rstrip("/")
+config_path = Path(os.environ["CONFIG_PATH"]).expanduser()
+model_override = os.environ.get("MODEL_OVERRIDE", "").strip()
+
+base_origin = server_url[:-3] if server_url.endswith("/v1") else server_url
+
+
+def fetch_json(url):
+    req = Request(url, headers={"Accept": "application/json"})
+    with urlopen(req, timeout=5) as resp:
+        charset = resp.headers.get_content_charset() or "utf-8"
+        return json.loads(resp.read().decode(charset))
+
+
+errors = []
+model_ids = []
+base_url = None
+
+for url in (f"{server_url}/v1/models", f"{base_origin}/v1/models"):
+    try:
+        payload = fetch_json(url)
+        data = payload.get("data") or []
+        model_ids = [item.get("id") for item in data if isinstance(item, dict) and item.get("id")]
+        if model_ids:
+            base_url = url[:-7]
+            break
+        errors.append((url, "no models returned"))
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+        errors.append((url, str(exc)))
+
+if not model_ids:
+    for url in (f"{base_origin}/api/tags", f"{server_url}/api/tags"):
+        try:
+            payload = fetch_json(url)
+            data = payload.get("models") or []
+            model_ids = [item.get("name") for item in data if isinstance(item, dict) and item.get("name")]
+            if model_ids:
+                base_url = f"{base_origin}/v1"
+                break
+            errors.append((url, "no models returned"))
+        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+            errors.append((url, str(exc)))
+
+if not model_ids:
+    print("Could not detect models from the server.", file=sys.stderr)
+    for url, message in errors:
+        print(f"  {url}: {message}", file=sys.stderr)
+    sys.exit(1)
+
+preferred = next((mid for mid in model_ids if "embedding" not in mid.lower()), model_ids[0])
+selected_model = model_override or f"openai/{preferred}"
+
+content = ""
+if config_path.exists():
+    content = config_path.read_text(encoding="utf-8")
+
+if content and not content.endswith("\n"):
+    content += "\n"
+
+
+def yaml_quote(value):
+    return json.dumps(value)
+
+
+def upsert_scalar(text, key, value):
+    pattern = re.compile(rf"(?m)^(?!\s*#)\s*{re.escape(key)}\s*:\s*.*$")
+    line = f"{key}: {yaml_quote(value)}"
+    if pattern.search(text):
+        return pattern.sub(line, text, count=1)
+    if text and not text.endswith("\n"):
+        text += "\n"
+    return text + line + "\n"
+
+
+content = upsert_scalar(content, "openai-api-base", base_url)
+content = upsert_scalar(content, "model", selected_model)
+
+config_path.write_text(content, encoding="utf-8")
+
+print(f"Configured aider server in {config_path}", file=sys.stderr)
+print(f"  openai-api-base: {base_url}", file=sys.stderr)
+print(f"  model: {selected_model}", file=sys.stderr)
+for model_id in model_ids:
+    print(f"  - openai/{model_id}", file=sys.stderr)
+PY
+}
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		--api-url)
+			API_URL="$2"
+			shift 2
+			;;
+		--model)
+			MODEL="$2"
+			shift 2
+			;;
+		--server)
+			SERVER="$2"
+			shift 2
+			;;
+		-h|--help)
+			usage
+			exit 0
+			;;
+		*)
+			break
+			;;
+	esac
+done
+
+self_path="$(ai::self_path "$0")"
+aider_bin="$(ai::resolve_bin aider "$self_path" "$HOME/.local/bin/aider" || true)"
+
+if [[ -z "$aider_bin" ]] || [[ "$(readlink -f "$aider_bin")" == "$self_path" ]]; then
+	echo "Installing aider-chat..." >&2
+	if ! ai::ensure_uv; then
+		echo "uv installation failed" >&2
+		exit 1
+	fi
+	uv tool install --python 3.12 --refresh-package aider-chat aider-chat >&2
+	ai::refresh_shell
+	aider_bin="$(ai::resolve_bin aider "$self_path" "$HOME/.local/bin/aider" || true)"
+	if [[ -z "$aider_bin" ]] || [[ "$(readlink -f "$aider_bin")" == "$self_path" ]]; then
+		echo "aider installation failed" >&2
+		exit 1
+	fi
+fi
+
+if [[ -n "$SERVER" ]]; then
+	configure_server "$SERVER"
+fi
+
+args=()
+
+if [[ -n "$API_URL" ]]; then
+	args+=(--openai-api-base "$API_URL")
+fi
+
+if [[ -n "$MODEL" ]]; then
+	args+=(--model "$MODEL")
+fi
+
+args+=("$@")
+
+"$aider_bin" "${args[@]}"

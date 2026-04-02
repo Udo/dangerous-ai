@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source "$(dirname "$0")/_common.sh"
+ai::setup_path
+
+MODEL=""
+API_URL=""
+SERVER=""
+
+usage() {
+	cat <<EOF
+Usage: $(basename "$0") [OPTIONS] [kiro-cli args...]
+
+Options:
+  --model MODEL         Persistently set Kiro's default model before launch
+  --api-url URL         Not supported by Kiro CLI
+  --server ADDR:PORT    Not supported by Kiro CLI
+  -h, --help            Show this help message
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		--model)
+			MODEL="$2"
+			shift 2
+			;;
+		--api-url)
+			API_URL="$2"
+			shift 2
+			;;
+		--server)
+			SERVER="$2"
+			shift 2
+			;;
+		-h|--help)
+			usage
+			exit 0
+			;;
+		*)
+			break
+			;;
+	esac
+done
+
+if [[ -n "$API_URL" ]] || [[ -n "$SERVER" ]]; then
+	echo "Kiro CLI does not currently document support for custom inference server endpoints." >&2
+	exit 1
+fi
+
+self_path="$(ai::self_path "$0")"
+kiro_bin="$(ai::resolve_bin kiro-cli "$self_path" "$HOME/.local/bin/kiro-cli" "$HOME/bin/kiro-cli" || true)"
+
+if [[ -z "$kiro_bin" ]] || [[ "$(readlink -f "$kiro_bin")" == "$self_path" ]]; then
+	echo "Installing Kiro CLI..." >&2
+	curl -fsSL https://cli.kiro.dev/install | bash >&2
+	ai::refresh_shell
+	kiro_bin="$(ai::resolve_bin kiro-cli "$self_path" "$HOME/.local/bin/kiro-cli" "$HOME/bin/kiro-cli" || true)"
+	if [[ -z "$kiro_bin" ]] || [[ "$(readlink -f "$kiro_bin")" == "$self_path" ]]; then
+		echo "kiro-cli installation failed" >&2
+		exit 1
+	fi
+fi
+
+if [[ -n "$MODEL" ]]; then
+	"$kiro_bin" settings chat.defaultModel "$MODEL" >/dev/null
+fi
+
+"$kiro_bin" "$@"

@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source "$(dirname "$0")/_common.sh"
+ai::setup_path
+
+API_URL=""
+MODEL=""
+SERVER=""
+
+usage() {
+	cat <<EOF
+Usage: $(basename "$0") [OPTIONS]
+
+Options:
+  --api-url URL    Custom Anthropic API endpoint
+  --server ADDR:PORT
+                   Custom Anthropic-compatible inference server
+  --model MODEL   Model to use (e.g., claude-sonnet-4-6, claude-opus-4-6)
+  -h, --help      Show this help message
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		--api-url)
+			API_URL="$2"
+			shift 2
+			;;
+		--server)
+			SERVER="$2"
+			shift 2
+			;;
+		--model)
+			MODEL="$2"
+			shift 2
+			;;
+		-h|--help)
+			usage
+			exit 0
+			;;
+		*)
+			break
+			;;
+	esac
+done
+
+if [[ -n "$SERVER" ]]; then
+	if [[ "$SERVER" == http://* ]] || [[ "$SERVER" == https://* ]]; then
+		API_URL="$SERVER"
+	else
+		API_URL="http://$SERVER"
+	fi
+fi
+
+self_path="$(ai::self_path "$0")"
+claude_bin="$(ai::resolve_bin claude "$self_path" "$HOME/.local/bin/claude" || true)"
+
+if [[ -z "$claude_bin" ]] || [[ "$(readlink -f "$claude_bin")" == "$self_path" ]]; then
+	echo "Installing @anthropic-ai/claude-code..." >&2
+	ai::npm_install_latest @anthropic-ai/claude-code
+	claude_bin="$(ai::resolve_bin claude "$self_path" "$HOME/.local/bin/claude" || true)"
+	if [[ -z "$claude_bin" ]] || [[ "$(readlink -f "$claude_bin")" == "$self_path" ]]; then
+		echo "claude installation failed" >&2
+		exit 1
+	fi
+fi
+
+if [[ -n "$API_URL" ]]; then
+	export ANTHROPIC_BASE_URL="$API_URL"
+fi
+if [[ -n "$MODEL" ]]; then
+	export ANTHROPIC_MODEL="$MODEL"
+fi
+
+IS_SANDBOX=1 "$claude_bin" --dangerously-skip-permissions "$@"
